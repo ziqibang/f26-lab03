@@ -119,21 +119,55 @@ Two problems. For each one, fill in all three parts.
 
 ### Problem 1
 
-**The problem.** Name it, using the vocabulary from lecture (milestone 2 in the
-handout names the three).
+**The problem.** Representational gap. "A booking" is not a type anywhere in the code —
+it is three unlinked artifacts that happen to agree: a raw `long[2]` in a list, and a
+name in a *second* map keyed by a *different* hand-built string, with the room and date
+never stored on the booking at all, only smeared across both keys.
 
-**Where in the code.** File and method.
+**Where in the code.** `InMemoryStore.java`: the two fields `slotsByRoomDate` and
+`bookerBySlot` (lines 13-14), and `addSlot` (16-31), `removeSlot` (33-47), and
+`bookerFor` (57-59), each of which reconstructs the composite key string from scratch
+and has to touch both maps in lockstep. `RequestHandler.rescheduleBooking`
+(lines 93, 98-99) depends on this: it finds the booker by rebuilding the old interval's
+key, deletes from both maps, then inserts fresh rows into both maps.
 
-**What it makes expensive.** A concrete future change, or something that already goes
-wrong today. What breaks first?
+**What it makes expensive.** Already goes wrong today: because a booking is only
+findable by an exact string match on `room|date|start|end`, `bookerFor` (`InMemoryStore
+.java:57-59`) has no notion of the booking's *identity* independent of its current
+interval — it can only be found by knowing that interval byte-for-byte. Concretely, a
+future feature already on the roadmap in `DESIGN.md`'s "Planned next" — recurring
+bookings — needs a per-booking attribute (a series id) that outlives a single interval.
+Adding it means adding a *third* parallel map keyed by yet another hand-assembled
+string, and updating `addSlot`/`removeSlot`/`rescheduleBooking` to keep three maps
+consistent instead of two, with no compiler check that a change to one key format was
+mirrored in the others.
 
 ### Problem 2
 
-**The problem.**
+**The problem.** Missing boundary. `DESIGN.md`'s diagram claims "storage is only ever
+reached from the handler, and only after the policy has approved the request" — but
+nothing in the code makes that true. There is no single gate a booking write must pass
+through; each operation decides for itself whether to validate, and one of them
+decided not to.
 
-**Where in the code.**
+**Where in the code.** `RequestHandler.rescheduleBooking` (lines 89-99) checks only
+`newEndMinutes <= newStartMinutes` and then calls `store.removeSlot(...)` /
+`store.addSlot(...)` directly — no call to `BookingPolicy` (which nothing in the
+codebase ever calls) and no repeat of the overlap loop that `createBooking`
+(lines 30-36) hand-rolls for itself. Compare the two methods side by side: `createBooking`
+and `rescheduleBooking` both end at the same `InMemoryStore`, but only one of them
+stands anything in front of it.
 
-**What it makes expensive.**
+**What it makes expensive.** Already goes wrong today: a reschedule can move a booking
+directly on top of a third, unrelated existing booking in the same room, and the call
+returns `"OK: moved ..."` — silently violating the one invariant `BookingPolicy` exists
+to name. This ships green because the only reschedule test,
+`RequestHandlerTest.rescheduleMovesABooking` (`RequestHandlerTest.java:59-67`), moves
+into an empty slot. Going forward, every operation `DESIGN.md`'s "Planned next" promises
+— recurring bookings, midnight-crossing bookings, per-building hours — needs a human to
+remember to re-insert the same checks, in the same order, at the top of a new method.
+Nothing catches it if they don't; this bug is proof that at least one contributor
+already forgot, and the next one has no reason to notice they're about to do it again.
 
 ---
 
