@@ -176,21 +176,95 @@ already forgot, and the next one has no reason to notice they're about to do it 
 Two different ways to carve up this system. A different split of responsibility, not a
 list of local code fixes. Read the handout's appendix before writing this section.
 
-### Alternative A
+### Alternative A: a `Booking` value type behind one enforced service gate
 
-**The decomposition.** What are the pieces, what does each own, and where do the rules
-live?
+**The decomposition.** Four pieces:
 
-**One tradeoff.** Something this option actually costs. "No real downside" is not a
-tradeoff.
+- `Booking` — an immutable value type (room, date, start, end, user) replacing the
+  `long[2]` plus the second `bookerBySlot` map. One object, one identity, no keeping two
+  maps in sync by hand.
+- `RoomScheduleStore` — replaces `InMemoryStore`. Keyed by room+date, it stores
+  `List<Booking>` and does *only* storage: add, remove, list. It knows nothing about
+  business hours or overlap.
+- `BookingPolicy` — unchanged in spirit, but now validates a candidate `Booking` against
+  a `List<Booking>` instead of raw `long[]`s.
+- `BookingService` — new. The single gate everything goes through. It exposes
+  `create`, `cancel`, `reschedule`, and `list`, and every mutating method follows the same
+  fixed shape internally: ask the store for the current bookings, ask `BookingPolicy` to
+  validate, and only then ask the store to write. `RequestHandler` shrinks to parsing
+  strings into a `Booking` and formatting `BookingService`'s results back into strings —
+  it no longer contains any rule logic itself (the inline overlap loop in today's
+  `createBooking` moves into `BookingPolicy`, called from `BookingService`).
 
-### Alternative B
+The rules live in exactly one place (`BookingPolicy`), and there is exactly one place
+that is allowed to call the store's mutating methods (`BookingService`), so a new
+operation added to `BookingService` cannot reach storage without going through
+validation first — the reschedule bug from Milestone 2 becomes structurally impossible
+to repeat, because `reschedule` and `create` are calls into the *same* internal
+validate-then-write method, not two independent hand-written sequences.
 
-**The decomposition.**
+**One tradeoff.** `BookingService`'s method shapes have to be designed before every
+future caller's needs are known. Recurring bookings and per-building hours (both named
+in `DESIGN.md`'s "Planned next") will likely need `create` to take more than
+room/date/start/end/user, or need a new method entirely — so this interface will churn
+for its first couple of real consumers, the same way the appendix's `LoanService` query
+interface would. It's also strictly more ceremony for a ~300-line prototype: a rule
+change today is one edit to `BookingPolicy.java`; after this split it is still one edit,
+but reaching it means already knowing that `RequestHandler` no longer holds the rules,
+`BookingService` orchestrates them, and `BookingPolicy` states them — three names to
+learn instead of one.
 
-**One tradeoff.**
+### Alternative B: schedules that own their own invariant
+
+**The decomposition.** Three pieces:
+
+- `RoomDay` — one object per room+date (what `InMemoryStore` today calls a
+  `"room|date"` key). It privately owns its bookings and is the *only* code in the
+  system that can add, remove, or move one. Its `book`, `cancel`, and `reschedule`
+  methods each re-check the overlap/hours/length rules against its own list before
+  mutating, internally — the invariant is enforced by the object refusing to become
+  invalid, not by a caller remembering to check first. `listBookings` hands out a copy,
+  never the live list (unlike today's `InMemoryStore.slotsFor`, which returns the actual
+  mutable list — a caller holding that reference could already corrupt a `RoomDay`
+  without going through any check at all).
+- `ScheduleRegistry` — a thin map from room+date to `RoomDay`. It owns lookup and
+  creation-on-first-use, nothing else. No rules, no validation.
+- `RequestHandler` — parses strings, asks `ScheduleRegistry` for the right `RoomDay`,
+  calls a method on it, formats the result.
+
+Here the rules live inside `RoomDay` itself (or in a small rules object `RoomDay` holds
+privately) rather than in a class other objects have to remember to consult — a
+`RoomDay` cannot be handed a double-booking, by construction, no matter which code is
+calling it or how many entry points exist.
+
+**One tradeoff.** Each `RoomDay` only ever sees its own room and day, so any rule that
+spans more than one — "the same user can't be double-booked into two different rooms at
+the same time," or a future per-building daily cap — has no home. It would need
+`ScheduleRegistry` (or something above it) to reach into multiple `RoomDay`s and
+cross-check them, which either re-introduces a coordinator that has to remember to call
+the right things in the right order (the exact failure mode this decomposition exists to
+avoid), or pushes `RoomDay` to expose enough of its internals for that coordinator to do
+the check itself, which erodes the "can't be handed a double-booking" guarantee this
+option is built around.
 
 ### Preference
 
-Which one, and under what conditions? Say what the choice depends on, and what would
-make you pick the other one instead.
+I'd pick **Alternative A**. `DESIGN.md`'s own "Planned next" list — recurring bookings
+and per-building hours — are both cross-cutting: a recurring booking has to be checked
+against a room's schedule on several different dates at once, and per-building hours
+means looking up a building's config, not just one room-day's local data. Alternative
+B's central guarantee (a `RoomDay` can't be corrupted regardless of caller) is strong
+exactly where the invariant is local, and both of those planned features are not local —
+they need a single place that can see across rooms, dates, or buildings, which is what
+`BookingService` is for and what a lone `RoomDay` structurally cannot do without being
+handed more visibility than this decomposition wants to give it.
+
+I would switch to Alternative B if the actual risk we were defending against were
+*many independent entry points into storage* rather than *rule complexity* — e.g., if
+`DESIGN.md`'s promised future HTTP layer, plus some admin script, plus a nightly cleanup
+job all ended up constructing their own path to the data, the way the appendix's reports
+screen and reminder job both read `LibraryManager`'s internals directly. Alternative A's
+guarantee only holds if every caller agrees to go through `BookingService`; nothing stops
+a new caller from importing `RoomScheduleStore` directly and skipping it, which is
+exactly how today's reschedule bug happened in the first place. Alternative B's guarantee
+holds even then, because there is no direct path to a `RoomDay`'s bookings to skip to.
