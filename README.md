@@ -30,3 +30,7 @@ java -cp target/classes edu.cmu.cs214.roomreserve.ReservationApp
 - Setup: `SETUP.md`
 
 See the Lab 3 handout on the course page for the three milestones you show a TA.
+
+## Tools used
+
+`CRITIQUE.md` was written with Claude Code, using the Sonnet 5 model.
